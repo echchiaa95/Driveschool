@@ -1,0 +1,156 @@
+
+name: DriveSchool OS - Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            driveschool-os/package-lock.json
+
+      - name: Extract project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f "driveschool-os.zip" ]; then
+            ZIP_FILE="driveschool-os.zip"
+          elif [ -f "DriveSchool-OS-starter.zip" ]; then
+            ZIP_FILE="DriveSchool-OS-starter.zip"
+          else
+            echo "ERROR: Project ZIP not found in repository root."
+            exit 1
+          fi
+
+          mkdir -p extracted
+          unzip -oq "$ZIP_FILE" -d extracted
+
+          PROJECT_DIR=""
+
+          if [ -f "extracted/package.json" ]; then
+            PROJECT_DIR="extracted"
+          else
+            while IFS= read -r file; do
+              PROJECT_DIR="$(dirname "$file")"
+              break
+            done < <(find extracted -mindepth 2 -maxdepth 4 \
+              -name package.json -not -path '*/node_modules/*' \
+              -print | sort)
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: package.json not found inside ZIP."
+            find extracted -maxdepth 3 -type f | head -100
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project found at: $PROJECT_DIR"
+
+      - name: Install dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Configure GitHub Pages base path
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.event.repository.name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+
+          const file = 'vite.config.js';
+          const tsFile = 'vite.config.ts';
+          const config = fs.existsSync(file) ? file :
+                         fs.existsSync(tsFile) ? tsFile : null;
+
+          if (!config) {
+            console.log('No Vite config found; checking package.json.');
+            process.exit(0);
+          }
+
+          let source = fs.readFileSync(config, 'utf8');
+          const base = process.env.REPOSITORY ===
+                       `${process.env.OWNER}.github.io`
+                       ? '/' : `/${process.env.REPOSITORY}/`;
+
+          if (/base\s*:/.test(source)) {
+            source = source.replace(
+              /base\s*:\s*(['"])[^'"]*\1/,
+              `base: '${base}'`
+            );
+          } else {
+            source = source.replace(
+              /defineConfig\s*\(\s*\{/,
+              match => `${match}\n  base: '${base}',`
+            );
+          }
+
+          fs.writeFileSync(config, source);
+          console.log(`GitHub Pages base path: ${base}`);
+          NODE
+
+      - name: Build production app
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: npm run build
+
+      - name: Verify build output
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          test -f dist/index.html
+          echo "Build output verified."
+          du -sh dist
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ env.PROJECT_DIR }}/dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
