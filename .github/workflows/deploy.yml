@@ -29,17 +29,22 @@ jobs:
         with:
           node-version: 22
 
-      - name: Locate and extract project ZIP
+      - name: Locate and extract project
         id: project
         shell: bash
         run: |
           set -euo pipefail
 
+          mkdir -p extracted
+          PROJECT_DIR=""
+
+          # Find a ZIP if one exists in the repository root.
           ZIP_FILE=""
 
           for candidate in \
-            "driveschool-os.zip" \
-            "DriveSchool-OS-starter.zip"
+            driveschool-os.zip \
+            driveschool-os-updated.zip \
+            DriveSchool-OS-starter.zip
           do
             if [ -f "$candidate" ]; then
               ZIP_FILE="$candidate"
@@ -47,51 +52,62 @@ jobs:
             fi
           done
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "::error::ZIP file not found in repository root."
-            echo "Upload driveschool-os.zip to the repository root."
-            exit 1
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Extracting $ZIP_FILE"
+            unzip -oq "$ZIP_FILE" -d extracted
+
+            if [ -f extracted/package.json ]; then
+              PROJECT_DIR="extracted"
+            else
+              while IFS= read -r file; do
+                PROJECT_DIR="$(dirname "$file")"
+                break
+              done < <(
+                find extracted -mindepth 2 -maxdepth 5 \
+                  -name package.json \
+                  -not -path '*/node_modules/*' \
+                  -print | sort
+              )
+            fi
           fi
 
-          mkdir -p extracted
-          unzip -oq "$ZIP_FILE" -d extracted
+          # Otherwise, use the project already in the repository.
+          if [ -z "$PROJECT_DIR" ] && [ -f package.json ]; then
+            PROJECT_DIR="."
+          fi
 
-          PROJECT_DIR=""
-
-          if [ -f "extracted/package.json" ]; then
-            PROJECT_DIR="extracted"
-          else
+          # Or locate package.json in an existing project folder.
+          if [ -z "$PROJECT_DIR" ]; then
             while IFS= read -r file; do
               PROJECT_DIR="$(dirname "$file")"
               break
             done < <(
-              find extracted -mindepth 2 -maxdepth 5 \
+              find . -mindepth 2 -maxdepth 4 \
                 -name package.json \
                 -not -path '*/node_modules/*' \
+                -not -path './.git/*' \
+                -not -path './extracted/*' \
                 -print | sort
             )
           fi
 
           if [ -z "$PROJECT_DIR" ]; then
-            echo "::error::No package.json found inside ZIP."
-            find extracted -maxdepth 4 -type f | head -100
+            echo "::error::Cannot find package.json or a project ZIP."
+            echo "Upload the ZIP or commit the project files."
             exit 1
           fi
 
           if [ ! -f "$PROJECT_DIR/package.json" ]; then
-            echo "::error::Invalid project directory."
+            echo "::error::package.json is missing."
             exit 1
           fi
 
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "Project directory: $PROJECT_DIR"
-
-          echo "Project files:"
-          ls -la "$PROJECT_DIR"
+          echo "Using project: $PROJECT_DIR"
+          cat "$PROJECT_DIR/package.json"
 
       - name: Install dependencies
         working-directory: ${{ steps.project.outputs.project_dir }}
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -101,82 +117,80 @@ jobs:
             npm install
           fi
 
-      - name: Configure GitHub Pages base path
+      - name: Configure Vite for GitHub Pages
         working-directory: ${{ steps.project.outputs.project_dir }}
         env:
           REPOSITORY: ${{ github.event.repository.name }}
           OWNER: ${{ github.repository_owner }}
-        shell: bash
         run: |
-          set -euo pipefail
-
           node --input-type=module <<'NODE'
           import fs from 'node:fs';
 
-          const candidates = [
+          const files = [
             'vite.config.ts',
             'vite.config.js',
             'vite.config.mts',
             'vite.config.mjs'
           ];
 
-          const config = candidates.find(
-            (file) => fs.existsSync(file)
-          );
+          const file = files.find(f => fs.existsSync(f));
 
-          if (!config) {
-            console.log(
-              'No Vite config found; base path was not modified.'
-            );
+          if (!file) {
+            console.log('No Vite config found; skipping base update.');
             process.exit(0);
           }
 
-          const repo = process.env.REPOSITORY;
-          const owner = process.env.OWNER;
-          const base = repo === `${owner}.github.io`
-            ? '/'
-            : `/${repo}/`;
+          let source = fs.readFileSync(file, 'utf8');
 
-          let source = fs.readFileSync(config, 'utf8');
+          const base =
+            process.env.REPOSITORY ===
+            `${process.env.OWNER}.github.io`
+              ? '/'
+              : `/${process.env.REPOSITORY}/`;
 
           if (/\bbase\s*:/.test(source)) {
             source = source.replace(
               /\bbase\s*:\s*(['"])[^'"]*\1/,
               `base: '${base}'`
             );
-          } else {
+          } else if (/defineConfig\s*\(\s*\{/.test(source)) {
             source = source.replace(
               /defineConfig\s*\(\s*\{/,
-              (match) => `${match}\n  base: '${base}',`
+              match => `${match}\n  base: '${base}',`
+            );
+          } else {
+            console.log(
+              'Review Vite base configuration manually.'
             );
           }
 
-          fs.writeFileSync(config, source);
-          console.log(`Configured Vite base: ${base}`);
+          fs.writeFileSync(file, source);
+          console.log(`Vite base path: ${base}`);
           NODE
 
-      - name: Build production app
+      - name: Build application
         working-directory: ${{ steps.project.outputs.project_dir }}
         env:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
-        run: npm run build
+        run: |
+          set -euo pipefail
+          npm run build
 
-      - name: Verify build output
+      - name: Verify build
         working-directory: ${{ steps.project.outputs.project_dir }}
-        shell: bash
         run: |
           set -euo pipefail
 
-          if [ ! -f dist/index.html ]; then
-            echo "::error::dist/index.html was not generated."
+          if [ ! -s dist/index.html ]; then
+            echo "::error::Build failed: dist/index.html is missing."
             exit 1
           fi
 
-          echo "Build verification successful."
+          echo "Build output verified."
           du -sh dist
 
-      - name: Upload GitHub Pages artifact
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: ${{ steps.project.outputs.project_dir }}/dist
